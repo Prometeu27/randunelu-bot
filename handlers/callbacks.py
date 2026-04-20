@@ -1,63 +1,57 @@
 # handlers/callbacks.py
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+import logging
+
+from telegram import Update
 from telegram.ext import ContextTypes
-from database import (
-    get_current_week, add_joiner,
-    get_joiners_for_week, get_connection
-)
-from utils import format_week_message
+
+from config import GROUP_CHAT_ID
+from database import add_participant, get_current_week
+from pinned_message import refresh_week_pinned_message
+
+logger = logging.getLogger(__name__)
 
 
 async def join_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handler pentru butonul 'Mă alătur'"""
+    """Handler pentru butonul 'Mă alătur'."""
     query = update.callback_query
-    await query.answer()
-
     user = query.from_user
     week = get_current_week()
 
     if not week:
-        await query.answer("⚠️ Nu există o săptămână activă.", show_alert=True)
+        await query.answer(
+            "⚠️ Nu există o săptămână activă momentan.", show_alert=True
+        )
         return
 
-    if week['is_completed']:
-        await query.answer("✅ Sarcina săptămânii e deja îndeplinită.", show_alert=True)
-        return
-
-    # Adaugă joiner
-    inserted = add_joiner(
-        week_id=week['id'],
+    inserted = add_participant(
+        week_id=week["id"],
         telegram_id=user.id,
-        display_name=user.full_name,
-        username=user.username
+        display_name=user.full_name or (user.username or str(user.id)),
+        username=user.username,
+        is_assigned=0,
     )
 
     if not inserted:
-        await query.answer("Ești deja în listă! 😊", show_alert=True)
+        await query.answer(
+            "Ești deja în lista acestei săptămâni! 😊", show_alert=True
+        )
         return
 
-    await query.answer("✅ Te-ai alăturat săptămâna asta!")
-
-    # Găsește membrul assigned
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("SELECT * FROM members WHERE id = ?", (week['assigned_member_id'],))
-    member = c.fetchone()
-    conn.close()
-
-    # Editează mesajul pinned cu lista actualizată
-    joiners = get_joiners_for_week(week['id'])
-    updated_text = format_week_message(
-        member['display_name'],
-        joiners,
-        is_completed=week['is_completed']
+    await query.answer(
+        "Te-ai alăturat echipei de rugăciune săptămâna asta! 🙏 "
+        "Când ești gata, bifează cu /done."
     )
 
-    keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("🙋 Mă alătur", callback_data="join")]
-    ])
-
+    display = user.full_name or (user.username or str(user.id))
     try:
-        await query.edit_message_text(text=updated_text, reply_markup=keyboard)
-    except Exception:
-        pass
+        await context.bot.send_message(
+            chat_id=GROUP_CHAT_ID,
+            text=(
+                f"🙋 {display} s-a alăturat echipei de rugăciune săptămâna asta! "
+                "Minunat! 🙏"
+            ),
+        )
+    except Exception as e:
+        logger.warning("Nu am putut anunța alăturarea lui %s în grup: %s", display, e)
+
+    await refresh_week_pinned_message(context.bot, week)

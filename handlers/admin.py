@@ -1,18 +1,26 @@
 # handlers/admin.py
 from telegram import Update
 from telegram.ext import ContextTypes
-from database import (
-    add_member, get_all_active_members,
-    get_member_by_telegram_id, set_member_active,
-    swap_rotation_order, get_current_week,
-    get_connection
-)
+
 from config import ADMIN_TELEGRAM_ID
+from database import (
+    add_member,
+    get_connection,
+    get_current_week,
+    get_member_by_telegram_id,
+    get_member_by_username,
+    get_members_by_group,
+    remove_participant_from_week,
+    set_member_active,
+    set_member_group,
+    swap_member_groups,
+)
+from pinned_message import refresh_week_pinned_message
 
 
 def is_admin(telegram_id):
     member = get_member_by_telegram_id(telegram_id)
-    if member and member['role'] == 'admin':
+    if member and member["role"] == "admin":
         return True
     if telegram_id == ADMIN_TELEGRAM_ID:
         return True
@@ -22,7 +30,6 @@ def is_admin(telegram_id):
 async def addmember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     /addmember <telegram_id> <display_name>
-    Ex: /addmember 123456789 Ion Popescu
     """
     user = update.effective_user
     if not is_admin(user.id):
@@ -42,7 +49,7 @@ async def addmember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     display_name = " ".join(args[1:])
     add_member(telegram_id=telegram_id, display_name=display_name)
-    await update.message.reply_text(f"✅ {display_name} a fost adăugat în rotație.")
+    await update.message.reply_text(f"✅ {display_name} a fost adăugat.")
 
 
 async def removemember_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -71,30 +78,146 @@ async def removemember_command(update: Update, context: ContextTypes.DEFAULT_TYP
         return
 
     set_member_active(telegram_id, False)
-    await update.message.reply_text(f"✅ {member['display_name']} a fost scos din rotație.")
+    await update.message.reply_text(
+        f"✅ {member['display_name']} a fost marcat ca inactiv."
+    )
 
 
 async def members_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /members — listează membrii activi cu ordinea rotației
+    /members — toți membrii cu grupă și status
     """
     user = update.effective_user
     if not is_admin(user.id):
         await update.message.reply_text("⛔ Nu ai permisiuni.")
         return
 
-    members = get_all_active_members()
-    if not members:
-        await update.message.reply_text("⚠️ Nu există membri activi.")
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT * FROM members
+        ORDER BY is_active DESC, group_id IS NULL, group_id, display_name
+        """
+    )
+    rows = c.fetchall()
+    conn.close()
+
+    if not rows:
+        await update.message.reply_text("⚠️ Nu există membri înregistrați.")
         return
 
-    lines = [f"{m['rotation_order']}. {m['display_name']} (ID: {m['telegram_id']})" for m in members]
-    await update.message.reply_text("👥 Membri în rotație:\n" + "\n".join(lines))
+    lines = []
+    for m in rows:
+        st = "activ" if m["is_active"] else "inactiv"
+        g = m["group_id"]
+        gtxt = f"grupa {g}" if g else "fără grupă"
+        lines.append(
+            f"• {m['display_name']} — {gtxt}, {st} (ID: {m['telegram_id']})"
+        )
+
+    await update.message.reply_text("👥 Membri:\n" + "\n".join(lines))
+
+
+async def groups_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔ Nu ai permisiuni.")
+        return
+
+    lines = ["👥 Grupele de rotație:\n"]
+    for gid in range(1, 8):
+        ms = get_members_by_group(gid)
+        if ms:
+            names = ", ".join(m["display_name"] for m in ms)
+        else:
+            names = "(nealocat)"
+        lines.append(f"Grupa {gid}: {names}")
+
+    conn = get_connection()
+    c = conn.cursor()
+    c.execute(
+        """
+        SELECT display_name FROM members
+        WHERE is_active = 1 AND group_id IS NULL
+        ORDER BY display_name
+        """
+    )
+    unassigned = [r[0] for r in c.fetchall()]
+    conn.close()
+
+    if unassigned:
+        lines.append("\n⚠️ Fără grupă: " + ", ".join(unassigned))
+    else:
+        lines.append("\n⚠️ Fără grupă: —")
+
+    await update.message.reply_text("\n".join(lines))
+
+
+async def setgroup_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    if not is_admin(user.id):
+        await update.message.reply_text("⛔ Nu ai permisiuni.")
+        return
+
+    args = context.args
+    reply = update.message.reply_to_message
+
+    if reply and args and len(args) == 1:
+        try:
+            group_id = int(args[0])
+        except ValueError:
+            await update.message.reply_text("⚠️ Grupa trebuie să fie un număr 1–7.")
+            return
+        target_tid = reply.from_user.id
+    elif args and len(args) >= 2:
+        try:
+            group_id = int(args[-1])
+        except ValueError:
+            await update.message.reply_text("⚠️ Ultimul argument trebuie să fie grupa 1–7.")
+            return
+        ref = " ".join(args[:-1]).strip()
+        if ref.startswith("@"):
+            ref = ref[1:]
+        if ref.isdigit():
+            target_tid = int(ref)
+        else:
+            m = get_member_by_username(ref)
+            if not m:
+                await update.message.reply_text(
+                    "⚠️ Nu găsesc un membru cu acest username. "
+                    "Folosește ID-ul Telegram sau răspunde la mesajul persoanei."
+                )
+                return
+            target_tid = m["telegram_id"]
+    else:
+        await update.message.reply_text(
+            "Folosire: /setgroup @username 3 sau /setgroup 123456789 3 "
+            "sau răspunde la mesaj cu /setgroup 3"
+        )
+        return
+
+    if group_id < 1 or group_id > 7:
+        await update.message.reply_text("⚠️ Grupa trebuie să fie între 1 și 7.")
+        return
+
+    mem = get_member_by_telegram_id(target_tid)
+    if not mem:
+        await update.message.reply_text(
+            "⚠️ Membrul nu e în baza de date. Adaugă-l mai întâi cu /addmember."
+        )
+        return
+
+    set_member_group(target_tid, group_id)
+    display = mem["display_name"]
+    await update.message.reply_text(
+        f"✅ {display} a fost atribuit grupei {group_id}."
+    )
 
 
 async def swap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /swap <telegram_id_1> <telegram_id_2>
+    /swap <telegram_id_1> <telegram_id_2> — schimbă grupele între doi membri
     """
     user = update.effective_user
     if not is_admin(user.id):
@@ -120,19 +243,35 @@ async def swap_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Unul dintre membri nu există.")
         return
 
-    swap_rotation_order(id1, id2)
+    if not swap_member_groups(id1, id2):
+        await update.message.reply_text(
+            "⚠️ Nu s-a putut schimba: verifică că ambele ID-uri există în baza de date."
+        )
+        return
+
     await update.message.reply_text(
-        f"✅ Ordinea schimbată între {m1['display_name']} și {m2['display_name']}."
+        f"✅ Grupele au fost schimbate între {m1['display_name']} și {m2['display_name']}."
     )
 
 
 async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
-    /skip — sare peste membrul curent, asignează următorul
+    /skip <telegram_id> — scoate membrul din participanții săptămânii curente
     """
     user = update.effective_user
     if not is_admin(user.id):
         await update.message.reply_text("⛔ Nu ai permisiuni.")
+        return
+
+    args = context.args
+    if not args:
+        await update.message.reply_text("Folosire: /skip <telegram_id>")
+        return
+
+    try:
+        telegram_id = int(args[0])
+    except ValueError:
+        await update.message.reply_text("⚠️ telegram_id trebuie să fie un număr.")
         return
 
     week = get_current_week()
@@ -140,32 +279,19 @@ async def skip_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("⚠️ Nu există o săptămână activă.")
         return
 
-    members = get_all_active_members()
-    if not members:
-        await update.message.reply_text("⚠️ Nu există membri activi.")
+    ok = remove_participant_from_week(week["id"], telegram_id)
+    if not ok:
+        await update.message.reply_text(
+            "⚠️ Membrul nu era în lista săptămânii curente."
+        )
         return
 
-    # Găsește indexul celui curent și ia următorul
-    current_id = week['assigned_member_id']
-    ids = [m['id'] for m in members]
+    await refresh_week_pinned_message(context.bot, week)
 
-    if current_id not in ids:
-        await update.message.reply_text("⚠️ Membrul curent nu mai e activ.")
-        return
-
-    current_index = ids.index(current_id)
-    next_index = (current_index + 1) % len(ids)
-    next_member = members[next_index]
-
-    conn = get_connection()
-    c = conn.cursor()
-    c.execute("UPDATE weeks SET assigned_member_id = ? WHERE id = ?",
-              (next_member['id'], week['id']))
-    conn.commit()
-    conn.close()
-
+    mem = get_member_by_telegram_id(telegram_id)
+    name = mem["display_name"] if mem else str(telegram_id)
     await update.message.reply_text(
-        f"⏭ Sărit. Acum e rândul lui {next_member['display_name']}."
+        f"⏭ {name} a fost scos din lista săptămânii curente."
     )
 
 
